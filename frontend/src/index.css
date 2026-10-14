@@ -509,6 +509,12 @@ button.ghost {
   color: var(--red);
 }
 
+.credit-card-visual .cc-sub-note {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  margin-top: 2px;
+}
+
 .credit-card-visual .cc-limit-row {
   display: flex;
   justify-content: space-between;

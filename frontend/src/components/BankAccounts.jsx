@@ -1,16 +1,25 @@
 import { formatBRL, bankColor, initials } from "../utils.js";
 
 function CreditCardVisual({ card }) {
-  const used = Math.abs(card.balance || 0);
+  // "Fatura atual" = soma das compras desde o fechamento da última fatura (calculado
+  // no backend via getCurrentInvoice). Cai pro saldo total do cartão só se, por algum
+  // motivo, esse cálculo não tiver rodado.
+  const temFaturaCalculada = card.faturaAtual != null;
+  const faturaAtual = temFaturaCalculada ? card.faturaAtual : Math.abs(card.balance || 0);
+  const totalUsado = Math.abs(card.balance || 0);
   const limit = card.creditData?.creditLimit ?? card.creditData?.creditLimitAmount ?? null;
-  const pct = limit ? Math.min(Math.round((used / limit) * 100), 100) : null;
+  const pct = limit ? Math.min(Math.round((totalUsado / limit) * 100), 100) : null;
+  const fechamento = card.faturaAtualInfo?.ultimaFaturaFechamento;
 
   return (
     <div className="credit-card-visual">
       <div className="cc-name">{card.marketingName || card.name}</div>
       {card.number && <div className="cc-number">•••• {card.number.slice(-4)}</div>}
       <div className="cc-used-label">Fatura atual</div>
-      <div className="cc-used-value">{formatBRL(used)}</div>
+      <div className="cc-used-value">{formatBRL(faturaAtual)}</div>
+      {totalUsado !== faturaAtual && (
+        <div className="cc-sub-note">Total usado no cartão: {formatBRL(totalUsado)}</div>
+      )}
       {limit != null && (
         <>
           <div className="cc-limit-row">

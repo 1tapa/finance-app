@@ -10,6 +10,7 @@ import {
   listAccounts,
   listTransactions,
   listBills,
+  getCurrentInvoice,
 } from "./pluggyClient.js";
 import * as manualStore from "./manualStore.js";
 
@@ -74,30 +75,78 @@ app.get("/api/accounts", async (req, res) => {
  * A Pluggy identifica todo Item do Meu Pluggy com connector genérico
  * ("MeuPluggy"), então o nome do banco de cada grupo vem do nome da conta
  * corrente/poupança daquele item (ou, na falta dela, da primeira conta).
+ *
+ * IMPORTANTE: às vezes o mesmo banco acaba conectado mais de uma vez no Meu
+ * Pluggy (dois "items" diferentes apontando pras mesmas contas/cartões —
+ * mesmos IDs). Se não filtrarmos isso, saldo, fatura e parcelas aparecem
+ * contados em dobro (ou divergentes, já que cada conexão duplicada pode ter
+ * lido as transações em momentos diferentes). getBankGroups() dedupe por
+ * accountId global, mantendo só a primeira ocorrência de cada conta.
  */
-app.get("/api/bancos", async (req, res) => {
-  try {
-    const itemIds = getConfiguredItemIds();
-    const grupos = await Promise.all(
-      itemIds.map(async (itemId) => {
-        const [item, accountsData] = await Promise.all([getItem(itemId), listAccounts(itemId)]);
-        const accounts = accountsData.results || [];
-        const contas = accounts.filter((a) => a.type === "BANK");
-        const cartoes = accounts.filter((a) => a.type === "CREDIT");
-        const nomeBanco =
-          contas[0]?.name || cartoes[0]?.name || item?.connector?.name || "Banco";
+let bankGroupsCache = null;
+let bankGroupsCacheAt = 0;
 
-        return {
-          itemId,
-          banco: nomeBanco,
-          status: item.status,
-          executionStatus: item.executionStatus,
-          lastUpdatedAt: item.lastUpdatedAt,
-          contas,
-          cartoes,
-        };
+async function getBankGroups({ fresh = false } = {}) {
+  const now = Date.now();
+  if (!fresh && bankGroupsCache && now - bankGroupsCacheAt < 30_000) {
+    return bankGroupsCache;
+  }
+
+  const itemIds = getConfiguredItemIds();
+  const seenAccountIds = new Set();
+  const grupos = [];
+
+  for (const itemId of itemIds) {
+    const [item, accountsData] = await Promise.all([getItem(itemId), listAccounts(itemId)]);
+    const accounts = (accountsData.results || []).filter((a) => {
+      if (seenAccountIds.has(a.id)) return false;
+      seenAccountIds.add(a.id);
+      return true;
+    });
+
+    // Se todas as contas desse item já tinham aparecido num item anterior,
+    // essa conexão inteira é uma duplicata — pula o grupo.
+    if (!accounts.length) continue;
+
+    const contas = accounts.filter((a) => a.type === "BANK");
+    const cartoesBrutos = accounts.filter((a) => a.type === "CREDIT");
+
+    // Para cada cartão, calcula a fatura "em aberto" (ainda fechando) de verdade —
+    // ver getCurrentInvoice(). Se der erro num cartão isolado, não derruba o resto.
+    const cartoes = await Promise.all(
+      cartoesBrutos.map(async (c) => {
+        try {
+          const atual = await getCurrentInvoice(c.id);
+          return { ...c, faturaAtual: atual.valor, faturaAtualInfo: atual };
+        } catch (err) {
+          console.error("Falha ao calcular fatura atual de", c.id, err.message);
+          return { ...c, faturaAtual: null, faturaAtualInfo: null };
+        }
       })
     );
+
+    const nomeBanco =
+      contas[0]?.name || cartoes[0]?.name || item?.connector?.name || "Banco";
+
+    grupos.push({
+      itemId,
+      banco: nomeBanco,
+      status: item.status,
+      executionStatus: item.executionStatus,
+      lastUpdatedAt: item.lastUpdatedAt,
+      contas,
+      cartoes,
+    });
+  }
+
+  bankGroupsCache = grupos;
+  bankGroupsCacheAt = now;
+  return grupos;
+}
+
+app.get("/api/bancos", async (req, res) => {
+  try {
+    const grupos = await getBankGroups({ fresh: req.query.fresh === "1" });
     res.json(grupos);
   } catch (err) {
     console.error(err);
@@ -108,19 +157,14 @@ app.get("/api/bancos", async (req, res) => {
 /** Soma saldos de contas/cartões + totais de renda e contas fixas, pro topo do dashboard. */
 app.get("/api/resumo", async (req, res) => {
   try {
-    const itemIds = getConfiguredItemIds();
+    const grupos = await getBankGroups();
     let saldoContas = 0;
     let saldoCartoes = 0;
 
-    await Promise.all(
-      itemIds.map(async (itemId) => {
-        const accountsData = await listAccounts(itemId);
-        for (const acc of accountsData.results || []) {
-          if (acc.type === "BANK") saldoContas += acc.balance || 0;
-          if (acc.type === "CREDIT") saldoCartoes += acc.balance || 0;
-        }
-      })
-    );
+    for (const grupo of grupos) {
+      for (const acc of grupo.contas) saldoContas += acc.balance || 0;
+      for (const acc of grupo.cartoes) saldoCartoes += acc.balance || 0;
+    }
 
     const salario = manualStore
       .list("salario")
@@ -154,16 +198,32 @@ app.get("/api/resumo", async (req, res) => {
 
 app.get("/api/accounts/:accountId/transactions", async (req, res) => {
   try {
+    // A API da Pluggy não aceita mais "from"/"to" como query param — filtra aqui.
     const { from, to } = req.query;
-    const data = await listTransactions(req.params.accountId, { from, to });
-    res.json(data);
+    const data = await listTransactions(req.params.accountId);
+    let results = data.results || [];
+    if (from) results = results.filter((t) => new Date(t.date) >= new Date(from));
+    if (to) results = results.filter((t) => new Date(t.date) <= new Date(to));
+    res.json({ results });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
+
 // ---- Parcelamentos de cartão (derivados de transações via Open Finance) ----
+
+/**
+ * A Nubank (e outros bancos) colocam o número da parcela dentro da própria
+ * descrição da transação (ex: "JIM.COM* 123 9/10"). Isso muda a cada parcela,
+ * então remover esse sufixo é essencial pra conseguir juntar as 10 parcelas
+ * de uma mesma compra num grupo só — sem isso, cada parcela vira "uma compra"
+ * diferente.
+ */
+function stripInstallmentSuffix(desc) {
+  return (desc || "").replace(/\s*\d{1,2}\/\d{1,2}\s*$/, "").trim();
+}
 
 async function computeInstallmentsForAccount(accountId) {
   const data = await listTransactions(accountId);
@@ -180,13 +240,14 @@ async function computeInstallmentsForAccount(accountId) {
   const grupos = {};
   for (const t of parceladas) {
     const meta = t.creditCardMetadata;
-    const key = [t.description, meta.purchaseDate, meta.totalInstallments, meta.billId || ""].join(
-      "|"
-    );
+    const descricaoLimpa = stripInstallmentSuffix(t.description);
+    // NÃO inclui billId na chave: cada parcela pertence a uma fatura/mês
+    // diferente por natureza, então usar billId quebraria o agrupamento.
+    const key = [descricaoLimpa, meta.purchaseDate, meta.totalInstallments].join("|");
 
     if (!grupos[key]) {
       grupos[key] = {
-        descricao: t.description,
+        descricao: descricaoLimpa,
         categoria: t.category,
         totalParcelas: meta.totalInstallments,
         valorParcela: Math.abs(t.amount),
@@ -197,13 +258,20 @@ async function computeInstallmentsForAccount(accountId) {
     grupos[key].parcelasVistas.push({
       numero: meta.installmentNumber,
       data: t.date,
-      billForecastDate: meta.billForecastDate,
     });
   }
 
+  const hoje = new Date();
+
   return Object.values(grupos).map((g) => {
-    const numerosVistos = g.parcelasVistas.map((p) => p.numero).sort((a, b) => a - b);
-    const parcelaAtual = numerosVistos[numerosVistos.length - 1] || 1;
+    // A Pluggy lista TODAS as parcelas de uma vez, incluindo as futuras (com
+    // data prevista de cobrança). "Parcela atual" é a última que já venceu —
+    // nunca uma parcela com data futura, senão a compra apareceria como
+    // "quitada" no dia em que foi feita.
+    const jaFaturadas = g.parcelasVistas
+      .filter((p) => new Date(p.data) <= hoje)
+      .map((p) => p.numero);
+    const parcelaAtual = jaFaturadas.length ? Math.max(...jaFaturadas) : 0;
     const restantes = Math.max(g.totalParcelas - parcelaAtual, 0);
     return {
       descricao: g.descricao,
@@ -230,18 +298,20 @@ app.get("/api/accounts/:accountId/installments", async (req, res) => {
   }
 });
 
-/** Parcelamentos de cartão de TODOS os bancos/cartões conectados, já identificados por banco. */
+/**
+ * Parcelamentos de cartão de TODOS os bancos/cartões conectados, já identificados
+ * por banco. Usa getBankGroups() (já deduplicado por conta) — sem isso, um banco
+ * conectado duas vezes faz cada parcela aparecer repetida na lista.
+ */
 app.get("/api/parcelamentos", async (req, res) => {
   try {
-    const itemIds = getConfiguredItemIds();
+    const grupos = await getBankGroups();
     const resultado = [];
 
-    for (const itemId of itemIds) {
-      const accountsData = await listAccounts(itemId);
-      const cartoes = (accountsData.results || []).filter((a) => a.type === "CREDIT");
-      for (const cartao of cartoes) {
-        const grupos = await computeInstallmentsForAccount(cartao.id);
-        for (const g of grupos) {
+    for (const grupo of grupos) {
+      for (const cartao of grupo.cartoes) {
+        const parcelas = await computeInstallmentsForAccount(cartao.id);
+        for (const g of parcelas) {
           resultado.push({
             ...g,
             banco: cartao.marketingName || cartao.name,
@@ -345,13 +415,11 @@ app.get("/api/projecao", async (req, res) => {
       }
     }
 
-    const itemIds = getConfiguredItemIds();
-    for (const itemId of itemIds) {
-      const accountsData = await listAccounts(itemId);
-      const cartoes = (accountsData.results || []).filter((a) => a.type === "CREDIT");
-      for (const cartao of cartoes) {
-        const grupos = await computeInstallmentsForAccount(cartao.id);
-        for (const g of grupos) {
+    const grupos = await getBankGroups();
+    for (const grupo of grupos) {
+      for (const cartao of grupo.cartoes) {
+        const parcelas = await computeInstallmentsForAccount(cartao.id);
+        for (const g of parcelas) {
           for (let i = 0; i < g.parcelasRestantes; i++) {
             adicionar(i, g.valorParcela, {
               tipo: "cartao",

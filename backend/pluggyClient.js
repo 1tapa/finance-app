@@ -119,14 +119,13 @@ export function listAccounts(itemId) {
 /**
  * O endpoint antigo GET /transactions foi descontinuado (410 ENDPOINT_DEPRECATED).
  * Usa GET /v2/transactions com paginação por cursor, percorrendo "next" até acabar.
- * A API atual não aceita mais "pageSize"/"limit" como parâmetro — cada página vem
- * com um tamanho fixo definido pela Pluggy (~500) e o "next" já traz o cursor pronto.
+ * A API atual não aceita mais "pageSize"/"limit" NEM "from"/"to" como parâmetro
+ * (testado em produção: retorna 400 "property X should not exist") — então
+ * sempre busca tudo (até maxPages) e quem chama filtra por data no próprio código.
  */
-export async function listTransactions(accountId, { from, to, maxPages = 10 } = {}) {
+export async function listTransactions(accountId, { maxPages = 10 } = {}) {
   let allResults = [];
-  let cursorParams = new URLSearchParams({ accountId });
-  if (from) cursorParams.set("from", from);
-  if (to) cursorParams.set("to", to);
+  const cursorParams = new URLSearchParams({ accountId });
 
   let nextPath = `/v2/transactions?${cursorParams.toString()}`;
   let pages = 0;
@@ -153,4 +152,47 @@ export async function listTransactions(accountId, { from, to, maxPages = 10 } = 
 
 export function listBills(accountId) {
   return pluggyRequest(`/bills?accountId=${accountId}`);
+}
+
+/**
+ * Calcula a fatura "em aberto" (ainda fechando) de um cartão: soma das compras
+ * feitas desde o fechamento da última fatura já fechada até hoje. A Pluggy só
+ * expõe faturas já FECHADAS via /bills (todas aparecem como já pagas), então
+ * o valor que ainda está "em formação" precisa ser somado a partir das
+ * transações — e tem que ignorar transações com data futura (parcelas futuras
+ * que a Pluggy já lista adiantado com a data de cobrança prevista).
+ */
+export async function getCurrentInvoice(accountId) {
+  const billsData = await listBills(accountId);
+  const bills = (billsData.results || [])
+    .slice()
+    .sort((a, b) => new Date(b.billClosingDate) - new Date(a.billClosingDate));
+  const ultimaFechada = bills[0] || null;
+
+  let cicloInicio = null;
+  if (ultimaFechada?.billClosingDate) {
+    cicloInicio = new Date(ultimaFechada.billClosingDate);
+    cicloInicio.setDate(cicloInicio.getDate() + 1);
+  }
+
+  const txData = await listTransactions(accountId);
+  const hoje = new Date();
+  const transacoesCiclo = (txData.results || []).filter((t) => {
+    const d = new Date(t.date);
+    if (d > hoje) return false; // parcela futura, ainda não entrou na fatura
+    if (cicloInicio && d < cicloInicio) return false;
+    return true;
+  });
+
+  let valor = 0;
+  for (const t of transacoesCiclo) {
+    if (t.type === "CREDIT") continue; // pagamento de fatura, não é compra
+    valor += Math.abs(t.amount);
+  }
+
+  return {
+    valor: Math.round(valor * 100) / 100,
+    ultimaFaturaFechamento: ultimaFechada?.billClosingDate || null,
+    ultimaFaturaVencimento: ultimaFechada?.dueDate || null,
+  };
 }
