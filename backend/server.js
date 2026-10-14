@@ -159,11 +159,15 @@ app.get("/api/resumo", async (req, res) => {
   try {
     const grupos = await getBankGroups();
     let saldoContas = 0;
-    let saldoCartoes = 0;
+    let saldoCartoes = 0; // total comprometido no cartão (inclui parcelas futuras) — usado só pro patrimônio líquido
+    let faturaAtualTotal = 0; // soma das faturas "em formação" de cada cartão — o que mostra pro usuário
 
     for (const grupo of grupos) {
       for (const acc of grupo.contas) saldoContas += acc.balance || 0;
-      for (const acc of grupo.cartoes) saldoCartoes += acc.balance || 0;
+      for (const acc of grupo.cartoes) {
+        saldoCartoes += acc.balance || 0;
+        faturaAtualTotal += acc.faturaAtual ?? Math.abs(acc.balance || 0);
+      }
     }
 
     const salario = manualStore
@@ -183,6 +187,7 @@ app.get("/api/resumo", async (req, res) => {
     res.json({
       saldoContas: round2(saldoContas),
       saldoCartoes: round2(saldoCartoes),
+      faturaAtualTotal: round2(faturaAtualTotal),
       patrimonio: round2(saldoContas - saldoCartoes),
       salario: round2(salario),
       contasFixas: round2(contasFixas),

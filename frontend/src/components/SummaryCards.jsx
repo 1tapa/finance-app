@@ -11,7 +11,12 @@ export default function SummaryCards({ resumo }) {
       wide: true,
     },
     { icon: Wallet, tone: "brand", label: "Saldo em contas", value: resumo.saldoContas },
-    { icon: CreditCard, tone: "red", label: "Fatura atual", value: resumo.saldoCartoes },
+    {
+      icon: CreditCard,
+      tone: "red",
+      label: "Fatura atual",
+      value: resumo.faturaAtualTotal ?? resumo.saldoCartoes,
+    },
     { icon: Banknote, tone: "green", label: "Salário mensal", value: resumo.salario },
     { icon: TrendingDown, tone: "amber", label: "Contas fixas/mês", value: resumo.contasFixas },
     { icon: Clock, tone: "brand", label: "A receber", value: resumo.receberPendente, wide: true },
